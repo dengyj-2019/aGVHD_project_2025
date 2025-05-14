@@ -28,17 +28,6 @@ library(clusterProfiler)
 #library(rliger)
 library(SeuratWrappers)
 
-Idents_proj <- function(
-    obj1, 
-    obj2
-){
-    new_identity <- rbind(data.frame(b = as.character(Idents(obj1)), row.names = names(Idents(obj1))),
-                    data.frame(b = as.character(Idents(obj2)), 
-                    row.names = names(Idents(obj2)))[setdiff(colnames(obj2), colnames(obj1)),,drop=F])
-    obj2 <- AddMetaData(obj2, metadata = new_identity, col.name ='new_identity')            
-    Idents(obj2) <- obj2$new_identity
-    return(obj2)
-}
 
 mycolors <-c('#E5D2DD', '#53A85F', '#F1BB72', '#F3B1A0', '#D6E7A3', '#57C3F3', '#476D87',
 '#E95C59', '#E59CC4', '#AB3282', '#23452F', '#BD956A', '#8C549C', '#585658',
