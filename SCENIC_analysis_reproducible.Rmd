@@ -1,0 +1,180 @@
+
+---
+title: "SCENIC Analysis with pySCENIC and R Visualization"
+author: "Reproducible Code for Review"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## Step 1: Generate `.loom` with Python
+
+This step is executed externally with the following Python script:
+
+```python
+import loompy as lp
+import numpy as np
+import scanpy as sc
+
+x = sc.read_csv("Tcell.csv")
+row_attrs = {"Gene": np.array(x.var_names)}
+col_attrs = {"CellID": np.array(x.obs_names)}
+lp.create("sample.loom", x.X.transpose(), row_attrs, col_attrs)
+```
+
+## Step 2: Run pySCENIC Workflow (Command-line)
+
+These commands are executed on the shell or server:
+
+```bash
+# Step 1: GRN inference
+
+pyscenic grn \
+--num_workers 60 \
+--output adj.sample.tsv \
+--method grnboost2 \
+sample.loom \
+hs_hgnc_tfs.txt
+
+
+# Step 2: Motif enrichment===
+#The full regulon prediction results, including all transcription factors and their predicted targets, are provided in sce.regulons.csv.
+#This file serves as the raw source for Supplementary Table 5 and has been deposited as part of the Source Data.
+pyscenic ctx \
+adj.sample.tsv \
+hg19-tss-centered-10kb-7species.mc9nr.feather \
+--annotations_fname motifs-v9-nr.hgnc-m0.001-o0.0.tbl \
+--expression_mtx_fname sample.loom \
+--mode "dask_multiprocessing" \
+--output reg.csv \
+--num_workers 60 \
+--mask_dropouts
+
+# Step 3: AUCell scoring
+pyscenic aucell \
+sample.loom \
+reg.csv \
+--output sample_SCENIC.loom \
+--num_workers 20
+
+```
+
+## Step 3: Load AUCell Results in R and Visualize
+
+```{r scenic-visualization}
+setwd("YOUR_PATH_HERE")  # Update accordingly
+
+# Load required libraries
+library(SCENIC)
+library(SCopeLoomR)
+library(AUCell)
+library(Seurat)
+library(ComplexHeatmap)
+library(tidyverse)
+library(data.table)
+library(ggraph)
+library(tidygraph)
+
+# Load loom
+sce_SCENIC <- open_loom("sce_SCENIC.loom")
+regulons_incidMat <- get_regulons(sce_SCENIC, column.attr.name = "Regulons")
+regulons <- regulonsToGeneLists(regulons_incidMat)
+regulonAUC <- get_regulons_AUC(sce_SCENIC, column.attr.name = "RegulonsAUC")
+close_loom(sce_SCENIC)
+
+# Integrate AUC with Seurat object
+seurat_obj <- readRDS("Tcell_seurat_object_V1.rds")
+next_regulonAUC <- regulonAUC[, match(colnames(seurat_obj), colnames(regulonAUC))]
+auc_values <- getAUC(next_regulonAUC)
+seurat_obj@meta.data <- cbind(seurat_obj@meta.data, t(auc_values))
+
+# Plot example
+FeaturePlot(seurat_obj, features = "STAT1(+)")
+```
+
+## Step 4: Network Plot of TF-Target Pairs
+
+```{r network-plot}
+library(stringr)
+library(ggrepel)
+
+# Load pySCENIC motif enrichment output (regulon annotations)
+sce_regulons <- read.csv("sce.regulons.csv")
+
+# Clean and reformat header
+sce_regulons <- sce_regulons[-2, ]
+colnames(sce_regulons) <- sce_regulons[1,]
+sce_regulons <- sce_regulons[-1, ]
+colnames(sce_regulons) <- c("TF","ID","AUC","NES","MotifSimilarityQvalue","OrthologousIdentity",
+                            "Annotation","Context","TargetGenes","RankAtMax")
+
+# Example: parse STAT1 regulon
+STAT1 <- subset(sce_regulons, TF == 'STAT1' & AUC > 0.15)[, c("TF", "TargetGenes")]
+STAT1$TargetGenes <- gsub("[\\[\\]\\(\\)']", "", STAT1$TargetGenes)  # Remove symbols
+split_STAT1 <- str_split(STAT1$TargetGenes, ",")
+
+# Convert string list into structured dataframe (target, score)
+df_list <- lapply(split_STAT1, function(x) as.data.frame(x, stringsAsFactors = FALSE))
+STAT1_combined <- do.call(rbind, df_list)
+names(STAT1_combined) <- "TF"
+STAT1_target <- STAT1_combined[seq(1, nrow(STAT1_combined), 2), , drop = FALSE]
+STAT1_score <- STAT1_combined[seq(2, nrow(STAT1_combined), 2), , drop = FALSE]
+STAT1_gene <- data.frame(target = STAT1_target$TF, score = STAT1_score$TF, tf = 'STAT1')
+STAT1_gene <- STAT1_gene[!duplicated(STAT1_gene$target), ]
+
+# Repeat above parsing for NR3C1
+NR3C1 <- subset(sce_regulons, TF == 'NR3C1' & AUC > 0.1)[, c("TF", "TargetGenes")]
+NR3C1$TargetGenes <- gsub("[\\[\\]\\(\\)']", "", NR3C1$TargetGenes)
+split_NR3C1 <- str_split(NR3C1$TargetGenes, ",")
+df_list <- lapply(split_NR3C1, function(x) as.data.frame(x, stringsAsFactors = FALSE))
+NR3C1_combined <- do.call(rbind, df_list)
+names(NR3C1_combined) <- "TF"
+NR3C1_target <- NR3C1_combined[seq(1, nrow(NR3C1_combined), 2), , drop = FALSE]
+NR3C1_score <- NR3C1_combined[seq(2, nrow(NR3C1_combined), 2), , drop = FALSE]
+NR3C1_gene <- data.frame(target = NR3C1_target$TF, score = NR3C1_score$TF, tf = 'NR3C1')
+NR3C1_gene <- NR3C1_gene[!duplicated(NR3C1_gene$target), ]
+
+# Merge both TF target lists
+TF_target <- rbind(STAT1_gene, NR3C1_gene)
+TF_target$score <- as.numeric(TF_target$score)
+
+# Build node table for visualization
+paths <- c("STAT1", "NR3C1")
+nodelist <- list()
+for (i in 1:length(paths)) {
+  node <- subset(TF_target, tf == paths[i])
+  nodes <- data.frame(name = unique(c(node$tf, node$target)))
+  node_values <- data.frame(name = c(paths[i], node$target),
+                            value = c(sum(node$score) / 10, node$score))
+  nodes <- merge(nodes, node_values, by = "name", all.x = TRUE)
+  nodes$value[is.na(nodes$value)] <- 0
+  nodelist[[i]] <- nodes
+}
+nodes <- do.call(rbind, nodelist)
+nodes$cluster <- unlist(lapply(1:length(paths), function(i) {
+  c(rep(paths[i], 1), rep(paste0(paths[i], "_gene"), nrow(nodelist[[i]]) - 1))
+}))
+
+# Build edge list
+edges <- TF_target[c("tf", "target", "score")]
+edges$class <- edges$tf
+
+# Build graph object and plot with ggraph
+layout_cir <- tbl_graph(nodes = nodes, edges = edges)
+p <- ggraph(layout_cir, layout = 'linear', circular = TRUE) +
+  geom_node_point(aes(size = value, colour = cluster)) +
+  geom_node_text(aes(x = 1.03 * x, y = 1.03 * y, label = name, color = cluster,
+                     angle = -((-node_angle(x, y) + 90) %% 180) + 90),
+                 hjust = 'outward') +
+  geom_edge_arc(aes(colour = class)) +
+  theme_void() +
+  theme(legend.position = "none") +
+  scale_colour_manual(values = c('#407972','#961E28','#D46724','#0f8096')) +
+  scale_edge_colour_manual(values = c('#961E28','#D46724','#0f8096')) +
+  scale_size_continuous(range = c(2, 8)) +
+  coord_cartesian(xlim = c(-1.5, 1.5), ylim = c(-1.5, 1.5))
+
+# =========================Export to PDF: Fig 5a===================================#
+ggsave("network_plot_STAT1.pdf", plot = p, width = 15, height = 15)
